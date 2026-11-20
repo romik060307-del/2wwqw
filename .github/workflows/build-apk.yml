@@ -1,0 +1,137 @@
+name: Build RXQhilo APK (dari ZIP)
+
+# Cara pakai:
+# 1. Di repo GitHub, upload RXQhilo-Android-Project-FIXED.zip ke folder paling luar (root).
+#    (Upload SATU file zip saja, jangan di-extract.)
+# 2. Simpan file ini di .github/workflows/build-apk.yml
+# 3. Tab Actions -> "Build RXQhilo APK (dari ZIP)" -> Run workflow
+# 4. Setelah selesai, download artifact "RXQhilo-1.0.0-Android-APK"
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: Bersihkan hasil build Gradle sebelum build
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rxqhilo-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo (isinya cuma file zip)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ekstrak proyek dari ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          COUNT="$(find . -maxdepth 1 -type f -name '*.zip' | wc -l)"
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "File .zip tidak ditemukan di root repo. Upload RXQhilo-Android-Project-FIXED.zip dulu." >&2; exit 1
+          elif [[ "$COUNT" -gt 1 ]]; then
+            echo "Ada $COUNT file .zip di root repo. Sisakan satu saja (hapus zip yang lama)." >&2
+            find . -maxdepth 1 -type f -name '*.zip' >&2; exit 1
+          fi
+          ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          echo "Memakai: $ZIP"
+          rm -rf unzipped app
+          mkdir unzipped app
+          unzip -q "$ZIP" -d unzipped
+          GRADLEW="$(find unzipped -maxdepth 3 -type f -name gradlew -print -quit)"
+          test -n "$GRADLEW" || { echo "gradlew tidak ditemukan di dalam zip." >&2; exit 1; }
+          ROOT="$(dirname "$GRADLEW")"
+          cp -a "$ROOT"/. app/
+          rm -rf unzipped
+          echo "Proyek siap di ./app ($(find app -type f | wc -l) file)"
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: app
+          cache-read-only: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Ambil modul sumber yang tidak ikut di zip (metroproto + opus)
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          rm -rf metroproto opusDecoder/src/main/jni/libopus
+          git clone --depth 1 https://github.com/MetrolistGroup/metroproto.git metroproto
+          git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git opusDecoder/src/main/jni/libopus
+          rm -rf metroproto/.git opusDecoder/src/main/jni/libopus/.git
+
+      - name: Pasang NDK dan CMake (dibutuhkan decoder Opus)
+        continue-on-error: true
+        shell: bash
+        working-directory: app
+        run: |
+          set -euo pipefail
+          NDK="$(grep -oP 'androidNdk\s*=\s*"\K[^"]+' gradle/libs.versions.toml)"
+          CMAKE="$(grep -oP 'opusCmakeVersion\s*=\s*"\K[^"]+' opusDecoder/build.gradle.kts)"
+          echo "NDK=$NDK CMAKE=$CMAKE"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "ndk;$NDK" "cmake;$CMAKE"
+
+      - name: Build RXQhilo debug APK
+        shell: bash
+        working-directory: app
+        env:
+          CLEAN_BUILD: ${{ inputs.clean_build }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          if [[ "$CLEAN_BUILD" == "true" ]]; then
+            ./gradlew clean --no-daemon
+          fi
+          ./gradlew :androidApp:assembleDebug --no-daemon --stacktrace --max-workers=4
+          mkdir -p dist
+          APK_PATH="$(find androidApp/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK_PATH" || { echo 'APK tidak ditemukan' >&2; exit 1; }
+          cp "$APK_PATH" dist/RXQhilo-1.0.0-debug.apk
+          sha256sum dist/RXQhilo-1.0.0-debug.apk | tee dist/SHA256SUMS.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RXQhilo-1.0.0-Android-APK
+          path: |
+            app/dist/RXQhilo-1.0.0-debug.apk
+            app/dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload laporan error (hanya kalau build gagal)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/**/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 7
